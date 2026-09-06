@@ -1,15 +1,12 @@
 /* Package tester can be used to perform repetition tests */
 package tester
 
-// #cgo CFLAGS: -g -Wall
-// #include <stdlib.h>
-// #include "timer.h"
-import "C"
-
 import (
 	"fmt"
 	"slices"
-	"time"
+	"syscall"
+
+	"github.com/fcassin/gotimer/timer"
 )
 
 type status int
@@ -39,19 +36,25 @@ type Tester struct {
 
 	err error
 
-	results     []*result
-	tscSum      int64
-	bytesSum    int64
-	minResult   *result
-	maxResult   *result
-	outputLines int
+	results      []*result
+	tscSum       int64
+	bytesSum     int64
+	minFaultsSum int64
+	majFaultsSum int64
+	minResult    *result
+	maxResult    *result
+	outputLines  int
 }
 
 type result struct {
-	tscStart int64
+	tscStart      int64
+	minFaultStart int64
+	majFaultStart int64
 
 	tscElapsed     int64
 	processedBytes int64
+	minFaults      int64
+	majFaults      int64
 }
 
 func newResult() *result {
@@ -59,20 +62,20 @@ func newResult() *result {
 }
 
 func NewTester(name string) *Tester {
-	cpuFrequency := getCPUTimerFreq(1000)
+	cpuFrequency := timer.GetCPUTimerFreq(1000)
 	return &Tester{
 		name:           name,
 		status:         starting,
 		cpuFrequency:   cpuFrequency,
 		testForTsc:     cpuFrequency * 10,
-		bestFoundAtTsc: readCPUTimer(),
+		bestFoundAtTsc: timer.ReadCPUTimer(),
 		results:        make([]*result, 0),
 	}
 }
 
 func (t *Tester) IsRunning() bool {
 	if t.status < failed {
-		return readCPUTimer()-t.bestFoundAtTsc < t.testForTsc
+		return timer.ReadCPUTimer()-t.bestFoundAtTsc < t.testForTsc
 	}
 
 	return false
@@ -88,8 +91,15 @@ func (t *Tester) Begin() error {
 
 	switch t.status {
 	case starting, running:
+		var ru syscall.Rusage
+		if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+			return t.failf("getrusage: %w", err)
+		}
+
 		result := newResult()
-		result.tscStart = readCPUTimer()
+		result.tscStart = timer.ReadCPUTimer()
+		result.minFaultStart = ru.Minflt
+		result.majFaultStart = ru.Majflt
 		t.current = result
 		t.status = running
 	case finished:
@@ -107,8 +117,15 @@ func (t *Tester) End() error {
 		return t.failf("tester must be running before calling End()")
 	}
 
-	tscEnd := readCPUTimer()
+	var ru syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+		return t.failf("getrusage: %w", err)
+	}
+
+	tscEnd := timer.ReadCPUTimer()
 	t.current.tscElapsed = tscEnd - t.current.tscStart
+	t.current.minFaults = ru.Minflt - t.current.minFaultStart
+	t.current.majFaults = ru.Majflt - t.current.majFaultStart
 
 	if t.best == nil || t.best.tscElapsed > t.current.tscElapsed {
 		t.bestFoundAtTsc = tscEnd
@@ -116,6 +133,8 @@ func (t *Tester) End() error {
 	}
 
 	t.tscSum += t.current.tscElapsed
+	t.minFaultsSum += t.current.minFaults
+	t.majFaultsSum += t.current.majFaults
 	if t.minResult == nil || t.current.tscElapsed < t.minResult.tscElapsed {
 		t.minResult = t.current
 	}
@@ -155,39 +174,6 @@ func (t *Tester) CountBytes(count int) error {
 	return nil
 }
 
-func readOSTimer() int64 {
-	return time.Now().UnixMicro()
-}
-
-func getOSTimerFreq() int64 {
-	return 1000000
-}
-
-func readCPUTimer() int64 {
-	cvalue := C.ReadCPUTimer()
-	return int64(cvalue)
-}
-
-// NOTE: Might want to move this into a commons package
-func getCPUTimerFreq(millisecondsToWait int64) int64 {
-	osFrequency := getOSTimerFreq()
-
-	cpuStart := readCPUTimer()
-	osStart := readOSTimer()
-	var osEnd, osElapsed int64
-	osWaitTime := osFrequency * millisecondsToWait / 1000
-	for osElapsed < osWaitTime {
-		osEnd = readOSTimer()
-		osElapsed = osEnd - osStart
-	}
-
-	cpuEnd := readCPUTimer()
-	cpuElapsed := cpuEnd - cpuStart
-	cpuFrequency := osFrequency * cpuElapsed / osElapsed
-
-	return cpuFrequency
-}
-
 func (t *Tester) msFromTsc(tsc int64) float64 {
 	return 1000 * float64(tsc) / float64(t.cpuFrequency)
 }
@@ -198,6 +184,14 @@ func throughputGBs(processedBytes int64, ms float64) float64 {
 	}
 	gigabytes := float64(processedBytes) / (1024 * 1024 * 1024)
 	return gigabytes / (ms / 1000)
+}
+
+func kbPerFault(processedBytes, faults int64) float64 {
+	if faults == 0 {
+		return 0
+	}
+	kilobytes := float64(processedBytes) / 1024
+	return kilobytes / float64(faults)
 }
 
 func (t *Tester) output() {
@@ -211,16 +205,25 @@ func (t *Tester) output() {
 
 		meanMs := t.msFromTsc(t.tscSum / int64(count))
 		meanBytes := t.bytesSum / int64(count)
+		meanFaults := (t.minFaultsSum + t.majFaultsSum) / int64(count)
 
 		minMs := t.msFromTsc(t.minResult.tscElapsed)
 		maxMs := t.msFromTsc(t.maxResult.tscElapsed)
 		medianMs := t.msFromTsc(median.tscElapsed)
 
+		minFaults := t.minResult.minFaults + t.minResult.majFaults
+		maxFaults := t.maxResult.minFaults + t.maxResult.majFaults
+		medianFaults := median.minFaults + median.majFaults
+
 		fmt.Printf("%s\n", t.name)
-		fmt.Printf("  Min:    %10.3fms, %7.3fGB/s\n", minMs, throughputGBs(t.minResult.processedBytes, minMs))
-		fmt.Printf("  Max:    %10.3fms, %7.3fGB/s\n", maxMs, throughputGBs(t.maxResult.processedBytes, maxMs))
-		fmt.Printf("  Mean:   %10.3fms, %7.3fGB/s\n", meanMs, throughputGBs(meanBytes, meanMs))
-		fmt.Printf("  Median: %10.3fms, %7.3fGB/s\n", medianMs, throughputGBs(median.processedBytes, medianMs))
+		fmt.Printf("  Min:    %10.3fms, %7.3fGB/s, PF: %6d (%8.1f kB/fault)\n",
+			minMs, throughputGBs(t.minResult.processedBytes, minMs), minFaults, kbPerFault(t.minResult.processedBytes, minFaults))
+		fmt.Printf("  Max:    %10.3fms, %7.3fGB/s, PF: %6d (%8.1f kB/fault)\n",
+			maxMs, throughputGBs(t.maxResult.processedBytes, maxMs), maxFaults, kbPerFault(t.maxResult.processedBytes, maxFaults))
+		fmt.Printf("  Mean:   %10.3fms, %7.3fGB/s, PF: %6d (%8.1f kB/fault)\n",
+			meanMs, throughputGBs(meanBytes, meanMs), meanFaults, kbPerFault(meanBytes, meanFaults))
+		fmt.Printf("  Median: %10.3fms, %7.3fGB/s, PF: %6d (%8.1f kB/fault)\n",
+			medianMs, throughputGBs(median.processedBytes, medianMs), medianFaults, kbPerFault(median.processedBytes, medianFaults))
 
 		t.outputLines = 5
 	}
